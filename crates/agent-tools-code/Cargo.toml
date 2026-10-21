@@ -1,0 +1,102 @@
+[package]
+name = "agent-tools-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "Generic coding tool pack (file CRUD, shell, grep, glob) implementing agent::tool::Tool"
+readme = "README.md"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Default ships the read-mostly subset so a host can `cargo add
+# agent-tools-code` and immediately invoke files + search without
+# pulling in shell/web. Hosts that need shell or web opt in
+# explicitly.
+default = ["fs", "search"]
+
+# File CRUD: FileRead / FileWrite / FileEdit / ListDir / Mkdir /
+# Move / Remove. Always-on tokio::fs.
+fs = []
+
+# Shell execution: Bash. Pulls shell-words for argv parsing.
+shell = ["dep:shell-words"]
+
+# Background shells: BashRun + BashOutput + KillShell. Shares the
+# ring-buffer + process-group-kill machinery from `shell` but
+# spawns + polls instead of blocking.
+bash-async = ["dep:shell-words"]
+
+# Search: Grep + Glob. Pulls regex (~5 MB) + ignore + ripgrep engine.
+search = ["dep:regex", "dep:ignore", "dep:grep"]
+
+# Web: WebFetch (HTTP GET → text). Pulls reqwest + futures for
+# streaming the response body so we can enforce the size cap
+# mid-stream rather than allocating the entire payload, plus url
+# for the SSRF guard's host parsing.
+web = ["dep:reqwest", "dep:futures", "dep:url"]
+
+# WebSearch tool with pluggable backends. Ships a Tavily impl as
+# the default; hosts can implement `WebSearchBackend` for Brave /
+# Bing / Kagi / SerpAPI / a private corpus. Reuses the `web`
+# feature's reqwest dep — no extra deps of its own.
+web-search = ["web"]
+
+# Spawn a child `agent::QueryLoop` from the model's
+# `Task` tool call. Pure logic; pulls `futures` for stream draining.
+task = ["dep:futures"]
+
+# In-memory TodoWrite list. Pure logic, no extra deps.
+todo = []
+
+# Jupyter notebook editing: NotebookEdit. Parses .ipynb (JSON) and
+# applies cell-level insert / replace / delete edits. Pure logic
+# on top of `serde_json` (already a workspace dep), no extras.
+notebook = []
+
+# Convenience: every tool flag on.
+all = ["fs", "shell", "bash-async", "search", "web", "web-search", "todo", "notebook", "task"]
+
+[dependencies]
+# Path + version: path wins for in-workspace builds; version pin keeps
+# cargo-deny's wildcard-dependency lint quiet for downstream consumers
+# who add this crate via `git`/`path` overrides.
+agent = { path = "../agent", version = "0.1.0", default-features = false }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }
+
+# Feature-gated optional deps
+regex = { workspace = true, optional = true }
+ignore = { workspace = true, optional = true }
+grep = { workspace = true, optional = true }
+shell-words = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = { workspace = true }
+assert_fs = { workspace = true }
+
+[[example]]
+name = "notebook_edit"
+required-features = ["notebook"]
+
+[[example]]
+name = "web_search_tavily"
+required-features = ["web-search"]

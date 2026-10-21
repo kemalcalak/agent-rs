@@ -1,0 +1,674 @@
+//! `Task` — let the model spawn a child `QueryLoop` to delegate
+//! a sub-task with isolated context.
+//!
+//! Modeled on Claude Code's `Task` tool. The model picks an
+//! `agent_type` and supplies a `description` + `prompt`; the host's
+//! `TaskAgentFactory` decides which `Provider` / model / tool
+//! registry / system prompt the child runs with. The child loop
+//! runs to completion and the aggregated assistant text is returned
+//! as the tool result, so the parent loop sees a single tool reply
+//! with the child's final answer — exactly like a tool call to any
+//! other tool.
+//!
+//! Why a factory instead of holding a single `Provider`? In real
+//! deployments hosts wire up multiple "agent shapes" (researcher /
+//! reviewer / planner) — different system prompts, different tool
+//! allowlists, sometimes different models. The factory layer is
+//! how the host expresses that vocabulary; the tool stays generic.
+//!
+//! Recursion safety: the host configures `max_depth` and the tool
+//! reads / increments a depth counter on `ctx`. We piggy-back on
+//! `ToolUseContext::abort` for cancellation — when the parent
+//! loop's abort fires, the child loop's stream surfaces an
+//! `AgentError::Aborted` and we forward it.
+//!
+//! Output shape: `{output, agent_type, usage_input_tokens,
+//! usage_output_tokens, stop_reason}`. Optional usage fields stay
+//! present even when zero so the parent model has a stable
+//! schema to reason about.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use agent::error::AgentError;
+use agent::file_cache::FileStateCache;
+use agent::hook::HookRunner;
+use agent::permission::PermissionManager;
+use agent::provider::Provider;
+use agent::query::QueryLoop;
+use agent::stream::{Event, ResultData};
+use agent::tool::{SafetyClass, Tool, ToolRegistry, ToolUseContext};
+use async_trait::async_trait;
+use futures::StreamExt;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+/// Configuration for a single agent shape (researcher, reviewer,
+/// planner, …). Returned from [`TaskAgentFactory::build`].
+#[derive(Debug, Clone)]
+pub struct TaskAgentConfig {
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
+    pub tools: Arc<ToolRegistry>,
+    /// Optional system prompt for the child.
+    pub system: Option<String>,
+    /// Optional cap on the child's tool-loop iterations. Defaults
+    /// to QueryLoop's default when `None`.
+    pub max_iterations: Option<usize>,
+    /// Optional shared permission manager. When `None`, the child
+    /// gets a fresh one — useful when the host wants the sub-agent
+    /// to fail-open on every permission decision (delegated trust)
+    /// or fail-closed (ask-the-user). Either is a host policy.
+    pub permissions: Option<Arc<PermissionManager>>,
+    /// Optional working directory for the child loop. When `None`,
+    /// QueryLoop's default applies. Hosts pass the parent cwd so the
+    /// child's path resolution and tool sandboxing match the parent.
+    pub cwd: Option<PathBuf>,
+    /// Optional shared file-state cache. When `None`, the child gets
+    /// its own. Sharing the parent's keeps read-before-write tracking
+    /// consistent across parent and child.
+    pub file_cache: Option<Arc<FileStateCache>>,
+    /// Optional shared hook runner. When `None`, the child runs without
+    /// hooks. Hosts pass the parent's runner so edit history, background-
+    /// shell tracking, and external hook blockers also apply to the child.
+    pub hooks: Option<Arc<HookRunner>>,
+    /// Optional observer that receives the child loop's start, each streamed
+    /// event, and finish. When `None`, the tool runs exactly as before.
+    pub observer: Option<Arc<dyn TaskObserver>>,
+}
+
+/// Optional observer of a child sub-agent's lifecycle. Hosts implement this
+/// to surface sub-agent progress in their UI. `on_start` returns a host id
+/// used to route subsequent `on_event`/`on_finish` calls. All methods are
+/// synchronous and must not block.
+pub trait TaskObserver: Send + Sync + std::fmt::Debug {
+    fn on_start(&self, agent_type: &str, description: Option<&str>, depth: usize) -> u64;
+    fn on_event(&self, id: u64, event: &Event);
+    fn on_finish(&self, id: u64, result: &str, error: Option<&str>);
+}
+
+/// RAII terminal for observer state. Tokio cancellation drops tool futures;
+/// without this guard, an observer row would remain `Running` forever.
+#[derive(Debug)]
+pub struct TaskFinishGuard {
+    observer: Arc<dyn TaskObserver>,
+    id: u64,
+    finished: bool,
+}
+
+impl TaskFinishGuard {
+    pub fn start(
+        observer: Arc<dyn TaskObserver>,
+        agent_type: &str,
+        description: Option<&str>,
+        depth: usize,
+    ) -> Self {
+        let id = observer.on_start(agent_type, description, depth);
+        Self {
+            observer,
+            id,
+            finished: false,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn on_event(&self, event: &Event) {
+        self.observer.on_event(self.id, event);
+    }
+
+    pub fn finish(&mut self, result: &str, error: Option<&str>) {
+        if !self.finished {
+            self.observer.on_finish(self.id, result, error);
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for TaskFinishGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.observer.on_finish(
+                self.id,
+                "",
+                Some("task cancelled before observer completion"),
+            );
+        }
+    }
+}
+
+/// Factory for resolving an `agent_type` string to a concrete
+/// child-loop config. Hosts implement this to enumerate which
+/// sub-agents the model is allowed to summon.
+#[async_trait]
+pub trait TaskAgentFactory: Send + Sync + std::fmt::Debug {
+    /// Build the child config. Implementations should return an
+    /// error if `agent_type` isn't recognized — the tool surfaces
+    /// it back to the model so it can pick a different one.
+    async fn build(&self, agent_type: &str) -> Result<TaskAgentConfig, AgentError>;
+}
+
+/// Default cap on Task-tool recursion depth. Hosts can override via
+/// [`TaskTool::with_max_depth`].
+pub const DEFAULT_MAX_DEPTH: usize = 3;
+
+#[derive(Debug)]
+pub struct TaskTool {
+    factory: Arc<dyn TaskAgentFactory>,
+    max_depth: usize,
+}
+
+impl TaskTool {
+    pub fn new(factory: Arc<dyn TaskAgentFactory>) -> Self {
+        Self {
+            factory,
+            max_depth: DEFAULT_MAX_DEPTH,
+        }
+    }
+
+    pub fn with_max_depth(mut self, n: usize) -> Self {
+        self.max_depth = n.max(1);
+        self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskInput {
+    /// Short label for the sub-task (1 line). Surfaces in
+    /// progress / hook output, not used to drive routing.
+    #[serde(default)]
+    description: Option<String>,
+    /// User-facing instructions for the child loop. This becomes
+    /// the child's first user message.
+    prompt: String,
+    /// Which agent shape to summon. Resolved against the
+    /// `TaskAgentFactory`.
+    agent_type: String,
+}
+
+#[async_trait]
+impl Tool for TaskTool {
+    fn name(&self) -> &str {
+        "Task"
+    }
+    fn description(&self) -> &str {
+        "Delegate a sub-task to a fresh child agent that runs to completion and \
+         returns its final assistant text as this tool's result. The child starts \
+         with NO conversation context, so `prompt` must be fully self-contained. \
+         Use it to parallelize independent work or to isolate large explorations \
+         from the main context; pick an `agent_type` registered with the host."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "Short label for the sub-task (1 line)."},
+                "prompt": {"type": "string", "description": "Complete, self-contained instructions for the child agent. It cannot see the parent conversation — include the goal, relevant file paths, constraints, and the exact form of result to return."},
+                "agent_type": {"type": "string", "description": "Agent shape to summon (host-defined)."}
+            },
+            "required": ["prompt", "agent_type"]
+        })
+    }
+    fn safety_class(&self) -> SafetyClass {
+        // Child loops can call mutating tools, but Task itself only
+        // forwards a prompt. The child's tools carry their own
+        // SafetyClass; the parent's permission gate evaluates Task
+        // independently of what the child ends up calling. Mark
+        // Mutating so the parent permission rules apply by default;
+        // hosts who disagree can wrap with PermissionMatcher.
+        SafetyClass::Mutating
+    }
+    async fn call(&self, ctx: &ToolUseContext, input: Value) -> Result<Value, AgentError> {
+        let parsed: TaskInput = serde_json::from_value(input)
+            .map_err(|e| AgentError::other(format!("Task invalid input: {e}")))?;
+        if parsed.prompt.trim().is_empty() {
+            return Err(AgentError::other("Task prompt must be non-empty"));
+        }
+        if parsed.agent_type.trim().is_empty() {
+            return Err(AgentError::other("Task agent_type must be non-empty"));
+        }
+
+        // Recursion guard. Depth lives in a process-global thread-
+        // local since `ToolUseContext` doesn't carry an extension
+        // map. Single-threaded per-call execution is the norm for
+        // the tool dispatch path, so this is fine.
+        let depth = ctx.task_depth;
+        if depth >= self.max_depth {
+            return Err(AgentError::other(format!(
+                "Task: max recursion depth {} reached (current depth {depth})",
+                self.max_depth
+            )));
+        }
+
+        let cfg = self
+            .factory
+            .build(&parsed.agent_type)
+            .await
+            .map_err(|e| AgentError::other(format!("Task factory: {e}")))?;
+
+        let mut builder =
+            QueryLoop::builder(cfg.provider.clone(), cfg.model.clone()).tools(cfg.tools.clone());
+        if let Some(s) = cfg.system.as_deref() {
+            builder = builder.system(s);
+        }
+        if let Some(n) = cfg.max_iterations {
+            builder = builder.max_iterations(n);
+        }
+        if let Some(p) = cfg.permissions.clone() {
+            builder = builder.permissions(p);
+        }
+        if let Some(c) = cfg.cwd.clone() {
+            builder = builder.cwd(c);
+        }
+        if let Some(fc) = cfg.file_cache.clone() {
+            builder = builder.file_cache(fc);
+        }
+        if let Some(h) = cfg.hooks.clone() {
+            builder = builder.hooks(h);
+        }
+
+        // Explicit depth chain: the child loop stamps depth+1 into every
+        // ToolUseContext it hands its tools, so a grandchild Task call sees
+        // the real nesting level. (The previous thread-local guard did not
+        // survive the child loop's tokio::spawn / work-stealing.)
+        builder = builder.task_depth(depth + 1).root_turn_owner(false);
+        let child = builder.build();
+        // Forward the parent's abort to the child so cancelling the
+        // outer loop also short-circuits the child.
+        let abort = ctx.abort.clone();
+
+        let mut stream = child.run(parsed.prompt.clone(), abort).await?;
+
+        let mut observation = cfg.observer.clone().map(|observer| {
+            TaskFinishGuard::start(
+                observer,
+                &parsed.agent_type,
+                parsed.description.as_deref(),
+                depth,
+            )
+        });
+
+        let mut output = String::new();
+        // Usage frames are cumulative WITHIN one provider turn and reset on
+        // the next; the child loop runs many turns (one per tool round-trip).
+        // Track the running per-turn peak and fold it into the totals when a
+        // counter regresses (= a new turn began) — a plain max would report
+        // only the largest single turn, undercounting multi-turn children.
+        let mut total_input = 0u32;
+        let mut total_output = 0u32;
+        let mut turn_input = 0u32;
+        let mut turn_output = 0u32;
+        let mut stop_reason: Option<String> = None;
+        let mut error: Option<AgentError> = None;
+        while let Some(event) = stream.next().await {
+            if let (Some(observation), Ok(ev)) = (&observation, &event) {
+                observation.on_event(ev);
+            }
+            match event {
+                Ok(Event::TextDelta { delta }) => output.push_str(&delta),
+                Ok(Event::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                }) => {
+                    if input_tokens < turn_input || output_tokens < turn_output {
+                        total_input = total_input.saturating_add(turn_input);
+                        total_output = total_output.saturating_add(turn_output);
+                        turn_input = 0;
+                        turn_output = 0;
+                    }
+                    turn_input = turn_input.max(input_tokens);
+                    turn_output = turn_output.max(output_tokens);
+                }
+                Ok(Event::Result {
+                    data:
+                        ResultData {
+                            stop_reason: sr, ..
+                        },
+                }) => {
+                    stop_reason = sr;
+                }
+                Ok(Event::Error { message, .. }) => {
+                    error = Some(AgentError::other(format!("Task child error: {message}")));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error = Some(e);
+                }
+            }
+        }
+        if let Some(observation) = &mut observation {
+            observation.finish(&output, error.as_ref().map(|e| e.to_string()).as_deref());
+        }
+        if let Some(e) = error {
+            return Err(e);
+        }
+        // Fold the final turn's peak into the totals.
+        let usage_input = total_input.saturating_add(turn_input);
+        let usage_output = total_output.saturating_add(turn_output);
+        Ok(json!({
+            "output": output,
+            "agent_type": parsed.agent_type,
+            "description": parsed.description,
+            "usage_input_tokens": usage_input,
+            "usage_output_tokens": usage_output,
+            "stop_reason": stop_reason,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::abort::AbortController;
+    use agent::file_cache::FileStateCache;
+    use agent::hook::HookRunner;
+    use agent::permission::PermissionManager;
+    use agent::provider::{ProviderCapabilities, StreamRequest};
+    use agent::stream::{Event as AgentEvent, EventStream};
+    use futures::stream;
+    use std::num::NonZeroUsize;
+
+    fn ctx() -> ToolUseContext {
+        ToolUseContext {
+            cwd: std::env::current_dir().unwrap(),
+            abort: AbortController::new(),
+            file_cache: Arc::new(FileStateCache::new(
+                NonZeroUsize::new(8).unwrap(),
+                1024 * 1024,
+            )),
+            permissions: Arc::new(PermissionManager::new()),
+            hooks: Arc::new(HookRunner::new()),
+            task_depth: 0,
+        }
+    }
+
+    /// Provider that emits a single TextDelta + Usage + Result and
+    /// terminates. Lets us drive the child QueryLoop to completion
+    /// without a real LLM.
+    #[derive(Debug)]
+    struct StubProvider {
+        reply: String,
+    }
+
+    #[async_trait]
+    impl Provider for StubProvider {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn stream(
+            &self,
+            _req: StreamRequest,
+            _abort: AbortController,
+        ) -> Result<Box<dyn EventStream>, AgentError> {
+            let reply = self.reply.clone();
+            let events: Vec<Result<AgentEvent, AgentError>> = vec![
+                Ok(AgentEvent::TextDelta { delta: reply }),
+                Ok(AgentEvent::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read: 0,
+                    cache_create: 0,
+                }),
+                Ok(AgentEvent::Result {
+                    data: ResultData {
+                        stop_reason: Some("end_turn".into()),
+                        ..Default::default()
+                    },
+                }),
+            ];
+            Ok(Box::new(stream::iter(events)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubFactory {
+        provider: Arc<dyn Provider>,
+        observer: Option<Arc<dyn TaskObserver>>,
+    }
+
+    #[async_trait]
+    impl TaskAgentFactory for StubFactory {
+        async fn build(&self, agent_type: &str) -> Result<TaskAgentConfig, AgentError> {
+            if agent_type == "researcher" {
+                Ok(TaskAgentConfig {
+                    provider: self.provider.clone(),
+                    model: "stub-model".into(),
+                    tools: Arc::new(ToolRegistry::new()),
+                    system: Some("you are a researcher".into()),
+                    max_iterations: Some(2),
+                    permissions: None,
+                    cwd: None,
+                    file_cache: None,
+                    hooks: None,
+                    observer: self.observer.clone(),
+                })
+            } else {
+                Err(AgentError::other(format!(
+                    "unknown agent_type: {agent_type}"
+                )))
+            }
+        }
+    }
+
+    fn factory(reply: &str) -> Arc<StubFactory> {
+        Arc::new(StubFactory {
+            provider: Arc::new(StubProvider {
+                reply: reply.into(),
+            }),
+            observer: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn task_returns_child_assistant_text() {
+        let tool = TaskTool::new(factory("the result is 42"));
+        let out = tool
+            .call(
+                &ctx(),
+                json!({"prompt": "compute", "agent_type": "researcher"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["output"], "the result is 42");
+        assert_eq!(out["agent_type"], "researcher");
+        assert_eq!(out["usage_input_tokens"], 10);
+        assert_eq!(out["usage_output_tokens"], 5);
+        assert_eq!(out["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn task_unknown_agent_type_errors() {
+        let tool = TaskTool::new(factory("x"));
+        let err = tool
+            .call(&ctx(), json!({"prompt": "x", "agent_type": "bogus"}))
+            .await
+            .expect_err("unknown");
+        assert!(err.to_string().contains("unknown agent_type"));
+    }
+
+    #[tokio::test]
+    async fn task_rejects_empty_prompt_or_agent_type() {
+        let tool = TaskTool::new(factory("x"));
+        let err = tool
+            .call(&ctx(), json!({"prompt": "  ", "agent_type": "researcher"}))
+            .await
+            .expect_err("empty");
+        assert!(err.to_string().contains("non-empty"));
+        let err = tool
+            .call(&ctx(), json!({"prompt": "x", "agent_type": "  "}))
+            .await
+            .expect_err("empty");
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[tokio::test]
+    async fn task_classified_mutating() {
+        let tool = TaskTool::new(factory("x"));
+        assert_eq!(tool.safety_class(), SafetyClass::Mutating);
+    }
+
+    #[tokio::test]
+    async fn task_max_depth_caps_recursion() {
+        let tool = TaskTool::new(factory("x")).with_max_depth(2);
+        // Depth now rides on the context (explicitly threaded parent→child),
+        // not a thread-local — simulate already being 2 levels in.
+        let mut deep = ctx();
+        deep.task_depth = 2;
+        let err = tool
+            .call(
+                &deep,
+                json!({"prompt": "go deeper", "agent_type": "researcher"}),
+            )
+            .await
+            .expect_err("depth exceeded");
+        assert!(err.to_string().contains("max recursion"));
+    }
+
+    /// Provider that emits `frames` of (input,output) Usage across ONE
+    /// stream. A decreasing frame simulates a turn boundary (usage resets
+    /// per provider turn), so this exercises the cross-turn accumulation
+    /// without a real multi-round-trip loop.
+    #[derive(Debug)]
+    struct MultiUsageProvider {
+        frames: Vec<(u32, u32)>,
+    }
+
+    #[async_trait]
+    impl Provider for MultiUsageProvider {
+        fn id(&self) -> &str {
+            "multi-usage"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn stream(
+            &self,
+            _req: StreamRequest,
+            _abort: AbortController,
+        ) -> Result<Box<dyn EventStream>, AgentError> {
+            let mut events: Vec<Result<AgentEvent, AgentError>> = Vec::new();
+            // Emit a text delta so the query loop does not classify this
+            // response as an empty completion and re-sample it (the loop
+            // retries bare `stop` responses once — DeepSeek occasionally
+            // emits one). Without it the usage frames below would be
+            // delivered twice and the peak math would double-count.
+            events.push(Ok(AgentEvent::TextDelta {
+                delta: "stub reply".into(),
+            }));
+            for (i, o) in &self.frames {
+                events.push(Ok(AgentEvent::Usage {
+                    input_tokens: *i,
+                    output_tokens: *o,
+                    cache_read: 0,
+                    cache_create: 0,
+                }));
+            }
+            events.push(Ok(AgentEvent::Result {
+                data: ResultData {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                },
+            }));
+            Ok(Box::new(stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_sums_usage_peaks_across_turns() {
+        // Two turns' worth of cumulative usage: turn A peaks at (10,5),
+        // then a drop to (3,2) marks turn B starting. Total must be the
+        // SUM of the per-turn peaks (13,7), not a global max (10,5).
+        let factory = Arc::new(StubFactory {
+            provider: Arc::new(MultiUsageProvider {
+                frames: vec![(4, 2), (10, 5), (3, 1), (8, 4)],
+            }),
+            observer: None,
+        });
+        let out = TaskTool::new(factory)
+            .call(
+                &ctx(),
+                json!({"prompt": "work", "agent_type": "researcher"}),
+            )
+            .await
+            .unwrap();
+        // Peaks: turn A = 10/5, turn B = 8/4 → 18 input, 9 output.
+        assert_eq!(out["usage_input_tokens"], 18);
+        assert_eq!(out["usage_output_tokens"], 9);
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingObserver {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TaskObserver for RecordingObserver {
+        fn on_start(&self, agent_type: &str, description: Option<&str>, depth: usize) -> u64 {
+            self.log.lock().unwrap().push(format!(
+                "start {agent_type} d{depth} desc={}",
+                description.unwrap_or("-")
+            ));
+            1
+        }
+        fn on_event(&self, id: u64, event: &AgentEvent) {
+            let kind = match event {
+                AgentEvent::TextDelta { .. } => "text",
+                AgentEvent::Usage { .. } => "usage",
+                AgentEvent::Result { .. } => "result",
+                _ => "other",
+            };
+            self.log.lock().unwrap().push(format!("event {id} {kind}"));
+        }
+        fn on_finish(&self, id: u64, result: &str, error: Option<&str>) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("finish {id} {result} err={}", error.unwrap_or("-")));
+        }
+    }
+
+    #[tokio::test]
+    async fn task_drives_observer_start_events_finish() {
+        let obs = Arc::new(RecordingObserver::default());
+        let factory = Arc::new(StubFactory {
+            provider: Arc::new(StubProvider {
+                reply: "the result is 42".into(),
+            }),
+            observer: Some(obs.clone()),
+        });
+        let tool = TaskTool::new(factory);
+        tool.call(
+            &ctx(),
+            json!({"prompt": "compute", "agent_type": "researcher", "description": "do math"}),
+        )
+        .await
+        .unwrap();
+        let log = obs.log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "start researcher d0 desc=do math".to_string(),
+                "event 1 text".to_string(),
+                "event 1 usage".to_string(),
+                "event 1 result".to_string(),
+                "finish 1 the result is 42 err=-".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn task_description_demands_self_contained_prompt() {
+        let tool = TaskTool::new(factory("test"));
+        assert!(tool.description().contains("self-contained"));
+        let schema = tool.input_schema();
+        let prompt_desc = schema["properties"]["prompt"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(prompt_desc.contains("cannot see the parent conversation"));
+    }
+}

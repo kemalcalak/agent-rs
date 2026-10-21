@@ -1,0 +1,111 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+readme = "../../README.md"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Phase 1+ surfaces. Default keeps the runtime + Anthropic provider (the hand-rolled
+# one — see notes/2026-05-01-sdk-maturity-research.md). OpenAI-compat / Ollama / MCP
+# / session persistence / swarm are opt-in so consumers (OP, Zode) only pull what
+# they actually wire up.
+default = ["anthropic"]
+
+# Provider gates (Phase 2 / 5)
+anthropic = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+# eventsource-stream + bytes power the hand-rolled SSE parser that reads
+# DeepSeek's `reasoning_content` deltas (async-openai's typed chunks drop
+# unknown fields).
+openai = ["dep:async-openai", "dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+ollama = ["dep:ollama-rs"]
+
+# Adjacent capability gates
+# `mcp` pulls reqwest because the OAuth helper in mcp::auth POSTs to
+# the token endpoint. Don't depend on the `anthropic` feature gating
+# — they're orthogonal capabilities.
+mcp = ["dep:rmcp", "dep:reqwest", "dep:bytes", "dep:http"] # Phase 5+ — MCP client + OAuth
+session-jsonl = ["dep:fs4"] # Phase 4 — JSONL persistence + file lock
+swarm = ["dep:fs4", "dep:notify"] # Phase 6 — mailbox / sub_agent / teams (lru is core)
+# Real BPE tokenizer (`tiktoken-rs`) — exposes `TiktokenTokenizer`
+# constructors for `cl100k_base` (Claude / GPT-3.5/4) /
+# `o200k_base` (GPT-4o) / `p50k_base` / `r50k_base`. Heuristic
+# tokenizer remains the default to keep dep weight off the no-extras
+# build.
+tiktoken = ["dep:tiktoken-rs"]
+
+# Convenience bundle for full feature set (used by OP today, by Zode tomorrow)
+full = ["anthropic", "openai", "ollama", "mcp", "session-jsonl", "swarm", "tiktoken"]
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+
+tracing = { workspace = true }
+
+uuid = { workspace = true }
+
+# Phase 1 utilities (always on — used by tool schema generation + file
+# state cache that ship as core API surface)
+schemars = { workspace = true }
+lru = { workspace = true }
+# Used by api::retry decorrelated jitter — always on, very small.
+rand = { workspace = true }
+
+# Feature-gated optional deps
+reqwest = { workspace = true, optional = true }
+eventsource-stream = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+async-openai = { workspace = true, optional = true }
+ollama-rs = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
+# fs4 returns when session JSONL writer (Phase 4) and mailbox (Phase 6)
+# need exclusive file locks. Phase 1's FileStateCache deliberately does
+# not lock reads — see file_cache module docstring.
+fs4 = { workspace = true, optional = true }
+notify = { workspace = true, optional = true }
+http = { version = "1", optional = true }
+tiktoken-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+assert_fs = { workspace = true }
+# Dev-only dep for the `with_tools` example. The prod runtime does
+# NOT depend on the tool pack — that stays in agent-tools-code.
+# Version pin keeps cargo-deny's wildcard-dependency lint quiet.
+agent-tools-code = { path = "../agent-tools-code", version = "0.1.0" }
+futures = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Direct process-group signalling for script-hook cleanup. Shelling out
+# to `/bin/kill -s SIG -<pgid>` parses differently (or not at all)
+# across kill implementations — some exit non-zero after delivering,
+# some exit 0 without delivering — so a group kill that works on one
+# machine silently no-ops on another. The syscall is the one
+# deterministic spelling. Already in the tree (tempfile/fs4/notify), so
+# this adds no new transitive weight.
+rustix = { version = "1", features = ["process"] }
+
+[[example]]
+name = "anthropic_basic"
+required-features = ["anthropic"]
+
+[[example]]
+name = "with_tools"
+required-features = ["anthropic"]
